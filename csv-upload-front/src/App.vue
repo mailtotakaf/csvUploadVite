@@ -78,7 +78,7 @@ const upload = async () => {
     }
 
     const data = await res.json();
-    status.value = 'アップロード完了';
+    status.value = `アップロード完了。登録件数: ${data.item_count}`;
     lastKey.value = data.key || JSON.stringify(data);
   } catch (err) {
     console.error(err);
