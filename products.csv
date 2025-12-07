@@ -1,0 +1,4 @@
+store_id,product_id,product_name,price,image_key
+101,P001,おにぎり鮭,130,product-images/101/P001.jpg
+101,P002,おにぎり梅,120,product-images/101/P002.jpg
+102,P010,唐揚げ弁当,450,product-images/102/P010.jpg

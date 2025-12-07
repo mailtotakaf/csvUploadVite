@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3 + CloudFront + API Gateway + Lambda for CSV upload SPA
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: csv-upload-test
+  LambdaRuntime:
+    Type: String
+    Default: python3.12
+
+Resources:
+  ########################################
+  # CSV保存用 S3 バケット
+  ########################################
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-upload-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Suspended
+
+  ########################################
+  # フロント用 S3 バケット（Vue / index.html）
+  ########################################
+  WebSiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-web-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ########################################
+  # CloudFront OAC（Origin Access Control）
+  ########################################
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ########################################
+  # CloudFront Distribution（SPA配信用）
+  ########################################
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: WebSiteOrigin
+            DomainName: !GetAtt WebSiteBucket.RegionalDomainName
+            S3OriginConfig: {}
+            OriginAccessControlId: !Ref CloudFrontOAC
+        DefaultCacheBehavior:
+          TargetOriginId: WebSiteOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  ########################################
+  # WebSiteBucket から CloudFront だけ読めるようにするポリシー
+  ########################################
+  WebSiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebSiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${WebSiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  ########################################
+  # Lambda Role
+  ########################################
+  UploadLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3UploadPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${UploadBucket.Arn}/*"
+      Policies:
+        - PolicyName: S3UploadPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${UploadBucket.Arn}/*"
+        - PolicyName: DynamoDBProductWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt ProductItemsTable.Arn
+
+  ########################################
+  # Lambda Function（CSVを S3 に保存＆CORS対応）
+  ########################################
+  UploadLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-upload-handler"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt UploadLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          UPLOAD_BUCKET: !Ref UploadBucket
+          PRODUCT_TABLE_NAME: !Ref ProductItemsTable
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import uuid
+          import datetime
+          import base64
+          import boto3
+
+          s3 = boto3.client("s3")
+          UPLOAD_BUCKET = os.environ["UPLOAD_BUCKET"]
+
+          def lambda_handler(event, context):
+              try:
+                  body = event.get("body", "")
+                  if event.get("isBase64Encoded"):
+                      data_bytes = base64.b64decode(body)
+                  else:
+                      data_bytes = body.encode("utf-8")
+
+                  key = "uploads/{}_{}.csv".format(
+                      datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"),
+                      uuid.uuid4().hex[:8]
+                  )
+
+                  s3.put_object(
+                      Bucket=UPLOAD_BUCKET,
+                      Key=key,
+                      Body=data_bytes,
+                      ContentType="text/csv"
+                  )
+
+                  return {
+                      "statusCode": 200,
+                      "headers": {
+                          "Content-Type": "application/json",
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Headers": "Content-Type",
+                          "Access-Control-Allow-Methods": "OPTIONS,POST"
+                      },
+                      "body": json.dumps({"message": "uploaded", "key": key})
+                  }
+              except Exception as e:
+                  return {
+                      "statusCode": 500,
+                      "headers": {
+                          "Content-Type": "application/json",
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Headers": "Content-Type",
+                          "Access-Control-Allow-Methods": "OPTIONS,POST"
+                      },
+                      "body": json.dumps({"error": str(e)})
+                  }
+
+  ########################################
+  # API Gateway REST API
+  ########################################
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+
+  ApiGatewayResourceUpload:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: upload
+
+  # POST /upload → Lambda Proxy
+  ApiGatewayMethodPostUpload:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ResourceId: !Ref ApiGatewayResourceUpload
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadLambdaFunction.Arn}/invocations"
+      MethodResponses:
+        - StatusCode: 200
+
+  # OPTIONS /upload (CORS用MOCK)
+  ApiGatewayMethodOptionsUpload:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ResourceId: !Ref ApiGatewayResourceUpload
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{ "statusCode": 200 }'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+            ResponseTemplates:
+              application/json: '{}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+          ResponseModels:
+            application/json: "Empty"
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayMethodPostUpload
+      - ApiGatewayMethodOptionsUpload
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: prod
+
+  ########################################
+  # Lambda Permission for API Gateway
+  ########################################
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UploadLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*/*/upload"
+
+  ProductItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-products"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: store_id
+          AttributeType: S
+        - AttributeName: product_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: store_id
+          KeyType: HASH
+        - AttributeName: product_id
+          KeyType: RANGE
+
+Outputs:
+  ApiEndpoint:
+    Description: Invoke URL for POST /upload
+    Value: !Sub "https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/upload"
+
+  WebsiteBucketName:
+    Description: S3 bucket for hosting Vue SPA
+    Value: !Ref WebSiteBucket
+
+  CloudFrontDomainName:
+    Description: CloudFront domain for the SPA
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  UploadBucketName:
+    Description: Bucket where CSV files are stored
+    Value: !Ref UploadBucket
